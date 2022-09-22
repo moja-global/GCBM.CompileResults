@@ -1,18 +1,13 @@
-import numpy as np
 import csv
-import uuid
-import vaex
 import logging
 import json
 import os
 import sys
-import sqlite3
-from itertools import islice
-from contextlib import contextmanager
+import polars as pl
+import polars.datatypes as dt
 from enum import Enum
 from argparse import ArgumentParser
 from glob import glob
-from tempfile import TemporaryDirectory
 from sqlalchemy import *
 
 
@@ -40,16 +35,6 @@ class FluxIndicator:
         self.flux_source = flux_source
 
 
-@contextmanager
-def vaex_open(file, **kwargs):
-    data = vaex.open(file, **kwargs)
-    try:
-        yield data
-    finally:
-        data.close()
-        data = None
-        
-        
 def read_flux_indicators(indicator_config):
     pool_collections = indicator_config["pool_collections"]
     fluxes = [
@@ -62,179 +47,110 @@ def read_flux_indicators(indicator_config):
     return fluxes
 
 
-def get_open_file_limit():
-    try:
-        if os.name == "nt":
-            import win32file
-            win32file._setmaxstdio(2048)
-            return win32file._getmaxstdio()
-        else:
-            import resource
-            return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    except:
-        return 100
+def merge(base_results_path, name):
+    results_group_path = os.path.join(base_results_path, name)
+    if not os.path.exists(results_group_path):
+        return false
 
-
-def try_groupby(df, *args, max_retries=10, **kwargs):
-    # Workaround for Vaex groupby randomly failing with an index error.
-    attempt = 1
-    while True:
-        try:
-            return df.groupby(*args, **kwargs)
-        except:
-            if attempt > max_retries:
-                raise
-            
-            attempt += 1
-
-
-def chunk(it, size):
-    it = iter(it)
-    return iter(lambda: tuple(islice(it, size)), ())
-
-
-def merge_chunk(files, output_path, sum_cols):
-    if os.path.exists(output_path):
-        os.remove(output_path)
-    
-    tmp_output = "_tmp".join(os.path.splitext(output_path))
-    vaex.open(files).export(tmp_output)
-    with vaex_open(tmp_output) as df:
-        try_groupby(df, set(df.get_column_names()) - set(sum_cols),
-                    agg={c: "sum" for c in sum_cols},
-                    assume_sparse=True).export(output_path)
-    
-    del df
-    os.remove(tmp_output)
-
-
-def merge(pattern, output_path, *sum_cols, chunk_size):
-    csv_files = glob(pattern)
-    if not csv_files:
-        return False
-
-    files_to_merge = []
-
+    header = None
     dtype = None
-    for batch in chunk(csv_files, chunk_size):
-        batch = list(batch)
-        if not dtype:
-            header = next(csv.reader(open(batch[0])))
+    sum_cols = None
+    groupby_cols = None
+    
+    for year in (
+        d for d in os.listdir(results_group_path)
+        if os.path.isdir(os.path.join(results_group_path, d))
+    ):
+        output_path = os.path.join(base_results_path, f"{name}_{year}.parquet")
+        if os.path.exists(output_path):
+            continue
+
+        year_dir = os.path.join(results_group_path, year)
+        year_file_pattern = os.path.join(year_dir, "*.csv")
+        if header is None:
+            csv_files = glob(year_file_pattern)
+            header = next(csv.reader(open(csv_files[0])))
             dtype = {
-                c: np.int if c == "year"
-                   else np.float32 if c in ("area", "flux_tc", "pool_tc")
-                   else np.str
+                c: dt.Float32 if c in ("area", "flux_tc", "pool_tc")
+                   else dt.Int32 if c in ("year", "disturbance_code")
+                   else str
                 for c in header
             }
-        
-        merged_output_file = f"_csv_{uuid.uuid1()}".join(os.path.splitext(output_path))
-        files_to_merge.append(merged_output_file)
-        with vaex_open(batch, low_memory=False, dtype=dtype, keep_default_na=False) as df:
-            try_groupby(df, set(df.get_column_names()) - set(sum_cols),
-                agg={c: "sum" for c in sum_cols},
-                assume_sparse=True
-            ).export(merged_output_file)
             
-        del df
-    
-    while len(files_to_merge) > chunk_size:
-        merged_chunks = []
-        for batch in chunk(files_to_merge, chunk_size):
-            merged_output_file = f"_chunk_{uuid.uuid1()}".join(os.path.splitext(output_path))
-            merge_chunk(batch, merged_output_file, sum_cols)
-            merged_chunks.append(merged_output_file)
-        
-        files_to_merge = merged_chunks
-    
-    if len(files_to_merge) > 1:
-        final_merged_file = "_merged".join(os.path.splitext(output_path))
-        vaex.open(files_to_merge).export(final_merged_file)
-        with vaex_open(final_merged_file) as df:
-            try_groupby(df, set(df.get_column_names()) - set(sum_cols),
-                        agg={c: "sum" for c in sum_cols},
-                        assume_sparse=True).export(output_path)
-        
-        del df
-        try:
-            os.remove(final_merged_file)
-        except:
-            pass
-    else:
-        os.rename(files_to_merge[0], output_path)
-    
+            sum_cols = [c for c in header if c in ("area", "flux_tc", "pool_tc")]
+            groupby_cols = list(set(header) - set(sum_cols))
+
+        pl.scan_csv(year_file_pattern, dtypes=dtype, null_values="").groupby(groupby_cols).agg([
+            pl.sum(col) for col in sum_cols
+        ]).collect().write_parquet(output_path)
+
     return True
 
 
-def vaex_to_table(data, db_path, table_name, *column_overrides, append=False, value_col=None):
+def df_to_table(data, db_path, table_name):
     output_db_engine = create_engine(f"sqlite:///{db_path}")
     conn = output_db_engine.connect()
+    
+    for sql in (
+        "PRAGMA main.cache_size=-1000000",
+        "PRAGMA synchronous=OFF",
+        "PRAGMA journal_mode=OFF"
+    ):
+        conn.execute(sql)
+
     with conn.begin():
-        cols = list(data.get_column_names())
-        override_cols = [c.name for c in column_overrides]
-        string_cols = set(cols) - set(override_cols)
+        col_types = [
+            (c, Numeric if c in ("area", "flux_tc", "pool_tc")
+               else Integer if c in ("year", "disturbance_code")
+               else Text)
+            for c in data.columns
+        ]
     
         md = MetaData()
         table = Table(table_name, md,
-            *(Column(c, Text) for c in cols if c not in override_cols),
-            *column_overrides
+            *(Column(c, dt) for (c, dt) in col_types)
         )
         
-        if not append:
-            table.drop(output_db_engine, checkfirst=True)
-            
-        table.create(output_db_engine, checkfirst=True)
+        table.create(conn, checkfirst=True)
         
-        for col in string_cols:
-            data[col].to_string()
-        
-        for _, _, chunk in data.to_records(chunk_size=10000):
-            conn.execute(insert(table), chunk)
-        
-        for col in string_cols:
-            conn.execute(f"UPDATE {table} SET {col} = NULL WHERE LOWER({col}) IN ('nan', 'nan.0')")
-        
-        if value_col:
-            conn.execute(delete(table).where(text(f"{value_col} IS NULL OR {value_col} = 0.0")))
+        slice_size = 1000000
+        slice_idx = 0
+        slice = data.slice(slice_idx, slice_size).collect()
+        while len(slice) > 0:
+            slice.to_pandas().to_sql(table_name, conn, index=False, if_exists="append")
+            slice_idx += slice_size
+            slice = data.slice(slice_idx, slice_size).collect()
 
 
 def compile_flux_indicators(merged_flux_data, indicators, output_db):
     flux_indicators = read_flux_indicators(indicators)
 
-    groupby_columns = (set(merged_flux_data.get_column_names())
+    groupby_columns = list(set(merged_flux_data.columns)
         - {"flux_tc", "from_pool", "to_pool"}
-        - set(c for c in merged_flux_data.get_column_names() if c.endswith("previous")))
+        - set(c for c in merged_flux_data.columns if c.endswith("previous")))
         
     for flux in flux_indicators:
         if flux.flux_source == FluxSource.Disturbance:
-            merged_flux_data.select(
-                (~merged_flux_data.disturbance_type.isna() & (merged_flux_data.disturbance_type != ""))
-                & merged_flux_data.from_pool.isin(flux.from_pools)
-                & merged_flux_data.to_pool.isin(flux.to_pools))
+            selection = merged_flux_data.filter((
+                ((pl.col("disturbance_type").is_not_null()) & (pl.col("disturbance_type") != ""))
+                & (pl.col("from_pool").is_in(flux.from_pools))
+                & (pl.col("to_pool").is_in(flux.to_pools))))
         elif flux.flux_source == FluxSource.AnnualProcess:
-            merged_flux_data.select(
-                (merged_flux_data.disturbance_type.isna() | (merged_flux_data.disturbance_type == ""))
-                & merged_flux_data.from_pool.isin(flux.from_pools)
-                & merged_flux_data.to_pool.isin(flux.to_pools))
+            selection = merged_flux_data.filter((
+                ((pl.col("disturbance_type").is_null()) | (pl.col("disturbance_type") == ""))
+                & (pl.col("from_pool").is_in(flux.from_pools))
+                & (pl.col("to_pool").is_in(flux.to_pools))))
         else:
-            merged_flux_data.select(merged_flux_data.from_pool.isin(flux.from_pools)
-                & merged_flux_data.to_pool.isin(flux.to_pools))
+            selection = merged_flux_data.filter((
+                (pl.col("from_pool").is_in(flux.from_pools))
+                & (pl.col("to_pool").is_in(flux.to_pools))))
         
-        if merged_flux_data.count(selection=True) == 0:
-            continue
-        
-        flux_data = try_groupby(
-            merged_flux_data,
-            groupby_columns,
-            agg={"flux_tc": vaex.agg.sum("flux_tc", selection=True)},
-            assume_sparse=True)
-            
-        flux_data["indicator"] = vaex.vconstant(flux.name, flux_data.shape[0])
-            
-        vaex_to_table(flux_data, output_db, "v_flux_indicators",
-            Column("year", Integer),
-            Column("disturbance_code", Integer),
-            Column("flux_tc", Numeric),
-            append=True, value_col="flux_tc")
+        flux_data = selection.groupby(groupby_columns).agg([pl.sum("flux_tc")]).select([
+            pl.all(),
+            pl.lit(flux.name).alias("indicator")
+        ])
+
+        df_to_table(flux_data, output_db, "v_flux_indicators")
 
 
 def compile_flux_indicator_aggregates(base_columns, indicator_config, output_db):
@@ -280,7 +196,7 @@ def compile_stock_change_indicators(base_columns, indicator_config, output_db):
             add_sub_sql = []
             add_sub_params = []
             for sign, flux_aggregates in components.items():
-                mult = 1 if sign == '+' else -1 if sign == '-' else 'err'
+                mult = 1 if sign == "+" else -1 if sign == "-" else "err"
                 add_sub_sql.append(f"WHEN indicator IN ({','.join('?' * len(flux_aggregates))}) THEN {mult}")
                 add_sub_params.extend(flux_aggregates)
             
@@ -367,14 +283,16 @@ def create_views(output_db):
             INNER JOIN (
                 SELECT
                     {','.join(raw_dist_cols)},
-                    age_range_previous AS pre_dist_age_range,
-                    age_range AS post_dist_age_range,
+                    age_range_previous,
+                    age_range,
                     SUM(flux_tc) AS flux_tc
                 FROM raw_fluxes
                 WHERE disturbance_type IS NOT NULL
-                GROUP BY {','.join(raw_dist_cols)}
+                GROUP BY {','.join(raw_dist_cols)}, age_range, age_range_previous
             ) AS f
             ON {' AND '.join((f'd.{c} = f.{c}' for c in raw_dist_cols))}
+                AND d.age_range = f.age_range
+                AND d.age_range_previous = f.age_range_previous
             """,
             f"""
             CREATE VIEW IF NOT EXISTS v_total_disturbed_areas AS
@@ -388,91 +306,59 @@ def create_views(output_db):
             conn.execute(sql)
 
 
-def compile_gcbm_output(results_path, output_db, indicator_config_file=None, chunk_size=None):
-    chunk_size = chunk_size or get_open_file_limit()
+def compile_gcbm_output(results_path, output_db, indicator_config_file=None):
     output_dir = os.path.dirname(output_db)
     os.makedirs(output_dir, exist_ok=True)
     
     if os.path.exists(output_db):
         os.remove(output_db)
-
-    with TemporaryDirectory(dir=output_dir) as tmp:
-        age_output_file = os.path.join(results_path, "age.parquet")
-        if (not os.path.exists(age_output_file)
-            and not merge(os.path.join(results_path, "age_*.csv"), age_output_file, "area", chunk_size=chunk_size)
-        ):
-            logging.info(f"No results to process in {results_path}")
-            return
+    
+    if not merge(results_path, "age"):
+        logging.info(f"No results to process in {results_path}")
+        return
+    
+    base_columns = None
+    for age_output_file in glob(os.path.join(results_path, "age_*.parquet")):
+        data = pl.scan_parquet(age_output_file)
+        if not base_columns:
+            base_columns = set(data.columns) - {"area"}
         
-        with vaex_open(age_output_file) as data:
-            base_columns = set(data.get_column_names()) - {"area"}
-            vaex_to_table(data, output_db, "raw_ages",
-                Column("year", Integer),
-                Column("area", Numeric)
-            )
-
+        df_to_table(data, output_db, "raw_ages")
         data = None
 
-        indicators = json.load(open(
-            indicator_config_file
-            or os.path.join(os.path.dirname(__file__), "compileresults.json")))
-        
-        dist_output_file = os.path.join(results_path, "disturbance.parquet")
-        if (os.path.exists(dist_output_file)
-            or merge(os.path.join(results_path, "disturbance_*.csv"), dist_output_file, "area", chunk_size=chunk_size)
-        ):
-            with vaex_open(dist_output_file) as data:
-                vaex_to_table(data, output_db, "raw_disturbances",
-                    Column("year", Integer),
-                    Column("disturbance_code", Integer),
-                    Column("area", Numeric)
-                )
+    indicators = json.load(open(
+        indicator_config_file
+        or os.path.join(os.path.dirname(__file__), "compileresults.json")))
+    
+    if merge(results_path, "disturbance"):
+        for dist_output_file in glob(os.path.join(results_path, "disturbance_*.parquet")):
+            data = pl.scan_parquet(dist_output_file)
+            df_to_table(data, output_db, "raw_disturbances")
+            data = None
 
-        data = None
+    if merge(results_path, "flux"):
+        for flux_output_file in glob(os.path.join(results_path, "flux_*.parquet")):
+            data = pl.scan_parquet(flux_output_file)
+            df_to_table(data, output_db, "raw_fluxes")
+            compile_flux_indicators(data, indicators, output_db)
+            data = None
 
-        flux_output_file = os.path.join(results_path, "flux.parquet")
-        if (os.path.exists(flux_output_file)
-            or merge(os.path.join(results_path, "flux_*.csv"), flux_output_file, "flux_tc", chunk_size=chunk_size)
-        ):
-            with vaex_open(flux_output_file) as data:
-                vaex_to_table(data, output_db, "raw_fluxes",
-                    Column("year", Integer),
-                    Column("disturbance_code", Integer),
-                    Column("flux_tc", Numeric)
-                )
+        compile_flux_indicator_aggregates(base_columns, indicators, output_db)
+        compile_stock_change_indicators(base_columns, indicators, output_db)
 
-                compile_flux_indicators(data, indicators, output_db)
+    if merge(results_path, "pool"):
+        for pool_output_file in glob(os.path.join(results_path, "pool_*.parquet")):
+            data = pl.scan_parquet(pool_output_file)
+            df_to_table(data, output_db, "raw_pools")
+            data = None
 
-            compile_flux_indicator_aggregates(base_columns, indicators, output_db)
-            compile_stock_change_indicators(base_columns, indicators, output_db)
+        compile_pool_indicators(base_columns, indicators, output_db)
 
-        data = None
-
-        pool_output_file = os.path.join(results_path, "pool.parquet")
-        if (os.path.exists(pool_output_file)
-            or merge(os.path.join(results_path, "pool_*.csv"), pool_output_file, "pool_tc", chunk_size=chunk_size)
-        ):
-            with vaex_open(pool_output_file) as data:
-                vaex_to_table(data, output_db, "raw_pools",
-                    Column("year", Integer),
-                    Column("pool_tc", Numeric)
-                )
-            
-            compile_pool_indicators(base_columns, indicators, output_db)
-            
-        data = None
-
-        error_output_file = os.path.join(results_path, "error.parquet")
-        if (os.path.exists(error_output_file)
-            or merge(os.path.join(results_path, "error_*.csv"), error_output_file, "area", chunk_size=chunk_size)
-        ):
-            with vaex_open(error_output_file) as data:
-                vaex_to_table(data, output_db, "raw_errors",
-                    Column("year", Integer),
-                    Column("area", Numeric)
-                )
-
-        data = None
+    if merge(results_path, "error"):
+        for error_output_file in glob(os.path.join(results_path, "error_*.parquet")):
+            data = pl.scan_parquet(error_output_file)
+            df_to_table(data, output_db, "raw_errors")
+            data = None
 
     create_views(output_db)
 
@@ -486,7 +372,6 @@ if __name__ == "__main__":
     parser.add_argument("results_path",       help="path to CSV output files", type=os.path.abspath)
     parser.add_argument("output_db",          help="path to the database to write results tables to", type=os.path.abspath)
     parser.add_argument("--indicator_config", help="indicator configuration file - defaults to a generic set")
-    parser.add_argument("--chunk_size",       help="number of CSV files to merge at a time", type=int)
     args = parser.parse_args()
     
-    compile_gcbm_output(args.results_path, args.output_db, args.indicator_config, args.chunk_size)
+    compile_gcbm_output(args.results_path, args.output_db, args.indicator_config)
