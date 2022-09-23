@@ -343,7 +343,7 @@ def compile_gcbm_output(title, conn_str, results_path, output_db, indicator_conf
         if not table_exists(conn, results_schema, "raw_ages"):
             return
         
-        spinup_year = next(conn.execute(text(f"SELECT MIN(year) - 1 FROM raw_ages")))[0]
+        spinup_year = next(conn.execute(text(f"SELECT MIN(year) - 1 FROM raw_ages WHERE year > 0")))[0]
 
         classifier_names = {col for col in conn.execute(text("SELECT * FROM raw_ages LIMIT 1")).keys()} \
             - {"year", "unfccc_land_class", "age_range", "area"}
