@@ -121,10 +121,10 @@ def compile_flux_indicators(conn, schema, indicator_config, classifiers):
         
         pool_filters = []
         pool_filter_params = {}
-        if ANY_POOL in flux.from_pools:
+        if ANY_POOL not in flux.from_pools:
             pool_filter.append("from_pool IN :from_pools")
             pool_filter_params["from_pools"] = flux.from_pools
-        if ANY_POOL in flux.to_pools:
+        if ANY_POOL not in flux.to_pools:
             pool_filter.append("to_pool IN :to_pools")
             pool_filter_params["to_pools"] = flux.to_pools
             
