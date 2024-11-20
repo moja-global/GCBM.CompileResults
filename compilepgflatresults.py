@@ -317,7 +317,7 @@ def create_views(conn, schema=None, disturbance_views=True, error_views=True, sp
                 WHERE (disturbance_type IS NOT NULL AND disturbance_type <> '')
                 GROUP BY {','.join(raw_dist_cols)}, age_range, age_range_previous
             ) AS f
-            ON {' AND '.join((f'd.{c} = f.{c}' for c in raw_dist_cols))}
+            ON {' AND '.join((f'((d.{c} IS NULL AND f.{c} IS NULL) OR (d.{c} = f.{c}))' for c in raw_dist_cols))}
                 AND d.age_range = f.age_range
                 AND d.age_range_previous = f.age_range_previous
             """,
